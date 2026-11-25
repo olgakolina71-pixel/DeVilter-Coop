@@ -2835,7 +2835,7 @@ function canMove(x, y){
 
 /* ==================== DAMAGE ==================== */
 function hitEnemy(e, dmg, ang, knock, noConc, stunDur, lockDur){
-  if(mpConnected&&mpRole!=='host'&&e._mpId){mpSend('sync',{payload:{kind:'hit',enemyId:e._mpId,playerId:mpClientId,damage:Math.round(dmg),angle:ang,px:player.x,py:player.y}});return;}
+  if(mpConnected&&mpRole!=='host'&&e._mpId){e.hurtFlash=Math.max(e.hurtFlash||0,.12);floaters.push({x:e.x,y:e.y-e.r-10,vy:-45,life:.35,max:.35,text:'УДАР',color:'#ffe7a0',size:11});mpSend('sync',{payload:{kind:'hit',enemyId:e._mpId,playerId:mpClientId,damage:Math.round(dmg),angle:ang,px:player.x,py:player.y,attackTime:player.attackTime||0}});return;}
   if (e.bossKind) dmg = bossDamageMod(e, dmg);
   if (e.type === 'necro' && necroShielded(e)){
     e.shieldFlash = 0.25;
@@ -6582,6 +6582,7 @@ function drawHUD(){
     if (stTxt){ ctx.font = 'bold 11px system-ui'; ctx.textBaseline = 'top'; ctx.fillStyle = stCol; ctx.fillText(stTxt, W/2, bby + bbh + 8); }
   }
   drawBottomHUD();
+  if(!IS_ANDROID){ctx.save();ctx.globalAlpha=.7;ctx.font='10px system-ui';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillStyle='#fff';ctx.fillText('WASD: движение · ЛКМ/Space: удар · ПКМ/F: второй удар · Q: способность · K: рывок · Shift: блок · I: инвентарь · T: обмен · R: помощь',12,H-72);ctx.restore();}
   if(mpConnected&&(gameState==='lobby'||gameState==='dungeon'||gameState==='downed')){
     const drawCoopTouch=(x,y,label,sub,color)=>{ctx.save();ctx.globalAlpha=0.88;ctx.fillStyle='rgba(12,7,18,0.9)';ctx.beginPath();ctx.arc(x,y,25,0,TAU);ctx.fill();ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,25,0,TAU);ctx.stroke();ctx.fillStyle=color;ctx.font='bold 11px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(label,x,y-2);ctx.fillStyle='#fff';ctx.font='bold 8px system-ui';ctx.fillText(sub,x,y+12);ctx.restore();};
     drawCoopTouch(W-64,72,'TRADE','ОБМЕН','#ffd166');drawCoopTouch(W-64,128,'HELP','ПОДЪЁМ','#7bff8a');
@@ -8519,7 +8520,7 @@ function render(){
   } else if (gameState === 'dungeon'){
     renderDungeon();
     if (paused) renderPause(); else drawHUD();
-  } else if (gameState === 'gameover'){
+  } else if (gameState === 'downed'){\n    renderDungeon();drawHUD();ctx.save();ctx.fillStyle='rgba(55,0,12,.42)';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#ff6379';ctx.font='bold 26px Georgia,serif';ctx.fillText('ПОВАЛЕН',W/2,H*.22);ctx.fillStyle='#fff';ctx.font='bold 13px system-ui';ctx.fillText('Нажми R или HELP — позови союзника',W/2,H*.27);ctx.restore();\n  } else if (gameState === 'gameover'){
     renderDungeon();
     renderGameOver();
   } else if (gameState === 'combos'){
@@ -8667,7 +8668,8 @@ canvas.addEventListener('pointerdown', (e) => {
   }
   if (gameState === 'downed'){ if(mpConnected&&Math.hypot(x-(W-64),y-128)<27)mpTryRevive(); else if(mpConnected&&Math.hypot(x-(W-64),y-72)<27)mpTradeStart(); return; }
   if (gameState === 'gameover'){ if (gameOverTimer > 0.8) enterLobby(); return; }
-  if (gameState === 'lobby') handleLobbyTap(x, y, e);
+  if(!IS_ANDROID&&e.pointerType==='mouse'&&(gameState==='lobby'||gameState==='dungeon')){if(e.button===0){input.attack.down=true;input.attack.id=e.pointerId;handleAttackPress();}else if(e.button===2){input.alt.down=true;input.alt.id=e.pointerId;doAltAttack();}else handleDungeonTap(x,y,e);}
+  else if (gameState === 'lobby') handleLobbyTap(x, y, e);
   else if (gameState === 'dungeon') handleDungeonTap(x, y, e);
   try { canvas.setPointerCapture(e.pointerId); } catch (_){}
 }, { passive: false });
@@ -8771,6 +8773,7 @@ window.addEventListener('keydown', (e) => {
     if (k === 'i'){ inventoryOpen = true; playerInventory.selectedSlot = null; resetInput(); e.preventDefault(); return; }
     if (k === 'escape'){ paused = true; resetInput(); e.preventDefault(); return; }
     if ((k === ' ' || k === 'j') && !e.repeat){ handleAttackPress(); e.preventDefault(); }
+    if(k==='f'&&!e.repeat){doAltAttack();e.preventDefault();}
     if ((k === 'e' || k === 'l') && !e.repeat){ doAltAttack(); e.preventDefault(); }
     if (k === 'q' && !e.repeat){ activateAbility(); e.preventDefault(); }
     if (k === 'k' && !e.repeat){ doDodge(); e.preventDefault(); }
@@ -8815,6 +8818,9 @@ function loop(now){
     if (gameState === 'loading'){ updateLoading(dt); updateAmbient(dt); render(); return; }
     if (gameState === 'settings' || inventoryOpen || paused || shopOpen || wardrobeOpen || abilitySelectOpen || forgeOpen || altarOpen || chronicleOpen){ if (toast.t > 0) toast.t -= dt; }
     else if (gameState === 'lobby' || gameState === 'dungeon'){
+      if (hitStop > 0) hitStop -= dt;
+      else update(dt);
+    } else if(gameState==='downed'){mpUpdate(dt);updateParticles(dt);updateFloaters(dt);updateCamera(dt);
       if (hitStop > 0) hitStop -= dt;
       else update(dt);
     } else {
