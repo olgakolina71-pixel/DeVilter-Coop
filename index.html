@@ -1,0 +1,1000 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07050b">
+<title>DeVilter</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{
+    width:100%;height:100%;overflow:hidden;background:#07050b;
+    -webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;
+    font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    touch-action:none;overscroll-behavior:none;
+  }
+  canvas{display:block;width:100%;height:100%;touch-action:none;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+const MAX_DPR = Math.min(window.devicePixelRatio || 1, 2);
+let currentDPR = IS_ANDROID ? Math.min(MAX_DPR, 1.25) : MAX_DPR;
+let W = 1, H = 1, vignette = null;
+let frameEMA = 16, lastDprChange = 0;
+
+function resize(){
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width  = Math.floor(W * currentDPR);
+  canvas.height = Math.floor(H * currentDPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(currentDPR, 0, 0, currentDPR, 0, 0);
+  const g = ctx.createRadialGradient(W/2, H/2, Math.min(W,H)*0.28, W/2, H/2, Math.max(W,H)*0.85);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.55, 'rgba(8,0,14,0.30)');
+  g.addColorStop(1, 'rgba(0,0,0,0.94)');
+  vignette = g;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 250));
+
+const TAU = Math.PI * 2;
+const clamp = (v,a,b) => v < a ? a : (v > b ? b : v);
+const lerp  = (a,b,t) => a + (b-a) * t;
+const rand  = (a,b) => a + Math.random() * (b-a);
+function angleDiff(a,b){
+  let d = (a - b) % TAU;
+  if (d >  Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+function rr(x,y,w,h,r){
+  if (w <= 0.5 || h <= 0.5) return;
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+}
+function hash2(x, y){
+  let h = (x * 73856093) ^ (y * 19349663);
+  h = (h ^ (h >> 13)) * 1274126177;
+  return ((h ^ (h >> 16)) & 0x7fffffff) / 0x7fffffff;
+}
+function isLandscape(){ return W >= H; }
+function hexA(hex, a){
+  if (typeof hex !== 'string' || hex[0] !== '#' || hex.length < 7) return `rgba(255,60,80,${a})`;
+  const h = hex.slice(1, 7);
+  const r = parseInt(h.substr(0,2), 16);
+  const g = parseInt(h.substr(2,2), 16);
+  const b = parseInt(h.substr(4,2), 16);
+  if (isNaN(r) || isNaN(g) || isNaN(b)) return `rgba(255,60,80,${a})`;
+  return `rgba(${r},${g},${b},${a})`;
+}
+function makeSeededRandom(seed){
+  let s = seed | 0;
+  if (s === 0) s = 1;
+  return function(){
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    return s / 0x7fffffff;
+  };
+}
+
+/* ==================== АУДИО: ДВИЖОК, ЗВУКИ, МУЗЫКА ==================== */
+let soundOn = true, musicVol = 0.7, sfxVol = 0.9;
+let audioCtx = null, masterG = null, musicBus = null, sfxBus = null, revIn = null;
+let _noiseBuf = null, _activeVoices = 0;
+function makeImpulse(sec, decay){
+  const sr = audioCtx.sampleRate, n = Math.floor(sr * sec), b = audioCtx.createBuffer(2, n, sr);
+  for (let c = 0; c < 2; c++){ const d = b.getChannelData(c); for (let i = 0; i < n; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/n, decay); }
+  return b;
+}
+function ensureAudio(){
+  if (audioCtx) return true;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    audioCtx = new AC();
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
+    masterG = audioCtx.createGain(); masterG.gain.value = 0.85;
+    masterG.connect(comp); comp.connect(audioCtx.destination);
+    musicBus = audioCtx.createGain(); sfxBus = audioCtx.createGain();
+    musicBus.connect(masterG); sfxBus.connect(masterG);
+    const conv = audioCtx.createConvolver(); conv.buffer = makeImpulse(2.4, 2.8);
+    revIn = audioCtx.createGain(); const revOut = audioCtx.createGain(); revOut.gain.value = 0.55;
+    revIn.connect(conv); conv.connect(revOut); revOut.connect(masterG);
+    _noiseBuf = audioCtx.createBuffer(1, audioCtx.sampleRate, audioCtx.sampleRate);
+    const nd = _noiseBuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random()*2-1;
+    applyVolumes();
+    return true;
+  } catch(e){ audioCtx = null; return false; }
+}
+function applyVolumes(){
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  musicBus.gain.setTargetAtTime(soundOn ? musicVol * 0.6 : 0, t, 0.05);
+  sfxBus.gain.setTargetAtTime(soundOn ? sfxVol : 0, t, 0.05);
+}
+/* один голос: осциллятор(ы) → фильтр → огибающая → шина (+ реверберация) */
+function voice(o){
+  const ac = audioCtx, t = ac.currentTime + 0.004 + (o.t || 0);
+  const dur = o.dur || 0.2, a = o.a || 0.004, vol = o.vol || 0.08;
+  const bus = o.bus || sfxBus;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + a);
+  if (o.hold) g.gain.setValueAtTime(vol, t + Math.min(o.hold, dur * 0.9));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  let head = g;
+  if (o.pan && ac.createStereoPanner){ const p = ac.createStereoPanner(); p.pan.value = o.pan; g.connect(p); head = p; }
+  head.connect(bus);
+  if (o.rev && revIn){ const rg = ac.createGain(); rg.gain.value = o.rev; head.connect(rg); rg.connect(revIn); }
+  let into = g;
+  if (o.lp || o.hp || o.bp){
+    const f = ac.createBiquadFilter();
+    f.type = o.bp ? 'bandpass' : (o.hp ? 'highpass' : 'lowpass');
+    const f0 = o.bp || o.hp || o.lp, f1 = o.lp2 || o.hp2 || o.bp2 || f0;
+    f.frequency.setValueAtTime(f0, t);
+    if (f1 !== f0) f.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+    f.Q.value = o.q || 0.8;
+    f.connect(g); into = f;
+  }
+  const n = o.voices || 1;
+  let first = null;
+  for (let i = 0; i < n; i++){
+    const os = ac.createOscillator();
+    os.type = o.type || 'sine';
+    const f0 = Math.max(20, o.f || 440);
+    os.frequency.setValueAtTime(f0, t);
+    if (o.f2) os.frequency.exponentialRampToValueAtTime(Math.max(20, o.f2), t + (o.slide || dur));
+    if (n > 1) os.detune.value = (i - (n-1)/2) * (o.det || 12);
+    if (o.vibD){
+      const lf = ac.createOscillator(), lg = ac.createGain();
+      lf.frequency.value = o.vibR || 6; lg.gain.value = o.vibD;
+      lf.connect(lg); lg.connect(os.frequency); lf.start(t); lf.stop(t + dur + 0.05);
+    }
+    os.connect(into);
+    os.start(t); os.stop(t + dur + 0.05);
+    if (!first) first = os;
+  }
+  _activeVoices++;
+  first.onended = () => { _activeVoices--; };
+}
+function noiz(o){
+  const ac = audioCtx, t = ac.currentTime + 0.004 + (o.t || 0);
+  const dur = o.dur || 0.15, a = o.a || 0.003, vol = o.vol || 0.06;
+  const s = ac.createBufferSource(); s.buffer = _noiseBuf; s.loop = true;
+  const f = ac.createBiquadFilter(); f.type = o.type || 'bandpass';
+  const f0 = o.f || 1000, f1 = o.f2 || f0;
+  f.frequency.setValueAtTime(f0, t);
+  if (f1 !== f0) f.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+  f.Q.value = o.q || 1;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(f); f.connect(g);
+  const bus = o.bus || sfxBus;
+  g.connect(bus);
+  if (o.rev && revIn){ const rg = ac.createGain(); rg.gain.value = o.rev; g.connect(rg); rg.connect(revIn); }
+  s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.05);
+  _activeVoices++;
+  s.onended = () => { _activeVoices--; };
+}
+const rv = (x, k) => x * (1 + (Math.random() - 0.5) * (k || 0.08));
+const SFX = {
+  /* ---- интерфейс ---- */
+  click(){ voice({type:'square', f:rv(1300), f2:900, dur:0.04, vol:0.03}); },
+  tab(){ voice({type:'triangle', f:rv(700), f2:1000, dur:0.06, vol:0.05}); },
+  open(){ voice({type:'sine', f:300, f2:620, dur:0.2, vol:0.06, rev:0.3}); noiz({f:1200, f2:3200, dur:0.2, vol:0.03}); },
+  close(){ voice({type:'sine', f:620, f2:280, dur:0.15, vol:0.05}); },
+  equip(){ noiz({f:2600, dur:0.06, vol:0.06, q:3}); voice({type:'triangle', f:rv(520), f2:260, dur:0.1, vol:0.07}); voice({type:'square', t:0.05, f:1200, f2:900, dur:0.05, vol:0.025}); },
+  unequip(){ noiz({f:1800, dur:0.07, vol:0.05, q:2}); voice({type:'triangle', f:rv(380), f2:520, dur:0.1, vol:0.05}); },
+  deny(){ voice({type:'sawtooth', f:200, f2:130, dur:0.16, vol:0.05, lp:900}); voice({type:'sawtooth', t:0.09, f:170, f2:100, dur:0.18, vol:0.05, lp:800}); },
+  buy(){ SFX.coin(); voice({type:'triangle', t:0.12, f:1200, f2:1800, dur:0.12, vol:0.04}); },
+  coin(){ voice({type:'square', f:rv(1568), dur:0.05, vol:0.035}); voice({type:'square', t:0.05, f:rv(2093), dur:0.22, vol:0.035, rev:0.25}); },
+  soul(){ voice({type:'sine', f:rv(740), f2:1480, dur:0.4, vol:0.05, rev:0.7, vibD:8, vibR:7}); voice({type:'sine', t:0.05, f:1110, f2:2220, dur:0.35, vol:0.025, rev:0.7}); },
+  pickup(){ voice({type:'triangle', f:660, f2:990, dur:0.1, vol:0.06}); voice({type:'triangle', t:0.07, f:990, f2:1320, dur:0.14, vol:0.05, rev:0.2}); },
+  potion(){ for (let i = 0; i < 3; i++) voice({type:'sine', t:i*0.1, f:rv(320 + i*60), f2:520 + i*80, dur:0.09, vol:0.07}); noiz({type:'lowpass', f:900, dur:0.35, vol:0.03}); },
+  levelup(){ [523, 659, 784, 1047].forEach((f, i) => voice({type:'triangle', t:i*0.075, f, dur:0.3, vol:0.06, rev:0.4})); },
+  toast(){ voice({type:'sine', f:880, dur:0.1, vol:0.03}); },
+  /* ---- оружие игрока ---- */
+  swing(){ SFX.swing_sword(); },
+  swing_sword(){ noiz({f:1500, f2:4500, dur:0.14, vol:0.05, q:1.5}); voice({type:'sine', f:rv(300), f2:180, dur:0.1, vol:0.02}); },
+  swing_axe(){ noiz({f:700, f2:2600, dur:0.2, vol:0.07, q:1.2}); voice({type:'sine', f:140, f2:70, dur:0.18, vol:0.05}); },
+  swing_knife(){ noiz({type:'highpass', f:3000, f2:7500, dur:0.08, vol:0.05, q:0.8}); },
+  swing_hammer(){ noiz({f:300, f2:1300, dur:0.28, vol:0.08, q:0.8}); voice({type:'sine', t:0.12, f:90, f2:45, dur:0.2, vol:0.07}); },
+  swing_whip(){ noiz({f:1500, f2:5200, dur:0.1, vol:0.05, q:2}); noiz({t:0.09, type:'highpass', f:4200, dur:0.05, vol:0.11}); },
+  swing_claws(){ noiz({f:2600, f2:3800, dur:0.07, vol:0.05, q:3}); noiz({t:0.06, f:2400, f2:3600, dur:0.07, vol:0.05, q:3}); },
+  /* ---- попадания и смерти ---- */
+  hit(){ voice({type:'sine', f:rv(170), f2:60, dur:0.1, vol:0.1}); noiz({type:'lowpass', f:1100, dur:0.07, vol:0.07}); },
+  hitBone(){ for (let i = 0; i < 2; i++) voice({type:'triangle', t:i*0.035, f:rv(900 - i*250), f2:500, dur:0.05, vol:0.06}); noiz({type:'highpass', f:2400, dur:0.05, vol:0.05}); },
+  hitArmor(){ voice({type:'square', f:rv(420), f2:300, dur:0.12, vol:0.045, voices:2, det:35, bp:900, q:3}); noiz({f:3200, dur:0.06, vol:0.05, q:3}); voice({type:'sine', f:110, f2:55, dur:0.12, vol:0.08}); },
+  heavyHit(){ voice({type:'sine', f:130, f2:38, dur:0.22, vol:0.14}); noiz({type:'lowpass', f:500, dur:0.14, vol:0.08}); },
+  kill(){ voice({type:'sawtooth', f:rv(300), f2:50, dur:0.2, vol:0.06, lp:1200}); noiz({type:'lowpass', f:900, dur:0.16, vol:0.07}); },
+  killBone(){ for (let i = 0; i < 6; i++) voice({type:'triangle', t:i*0.03 + Math.random()*0.02, f:rv(500 + Math.random()*700), f2:300, dur:0.05, vol:0.045}); noiz({type:'highpass', f:2500, dur:0.18, vol:0.035}); },
+  killOgre(){ voice({type:'sawtooth', f:100, f2:48, dur:0.7, vol:0.09, lp:420, vibD:6, vibR:9}); voice({type:'sine', t:0.1, f:70, f2:30, dur:0.35, vol:0.12}); noiz({type:'lowpass', f:300, dur:0.3, vol:0.08}); },
+  killNecro(){ voice({type:'sine', f:700, f2:180, dur:0.7, vol:0.07, rev:0.8, vibD:20, vibR:11}); voice({type:'sawtooth', f:260, f2:90, dur:0.5, vol:0.03, lp:900, rev:0.5}); },
+  killBoss(){ SFX.boom(); voice({type:'sawtooth', t:0.1, f:70, f2:30, dur:1.1, vol:0.1, lp:500, rev:0.6}); [392, 494, 587].forEach((f, i) => voice({type:'triangle', t:0.45 + i*0.1, f, dur:1.0, vol:0.05, rev:0.8})); },
+  hurt(){ voice({type:'sawtooth', f:rv(230), f2:110, dur:0.2, vol:0.07, lp:1400}); noiz({type:'lowpass', f:700, dur:0.12, vol:0.06}); },
+  death(){ voice({type:'sawtooth', f:260, f2:30, dur:1.2, vol:0.09, lp:900, rev:0.5}); [330, 262, 196, 147].forEach((f, i) => voice({type:'sine', t:0.2 + i*0.22, f, dur:0.9, vol:0.05, rev:0.9})); },
+  /* ---- защита и умения ---- */
+  block(){ voice({type:'square', f:rv(380), f2:260, dur:0.1, vol:0.05, bp:1200, q:2}); noiz({f:2000, dur:0.07, vol:0.06, q:2}); voice({type:'sine', f:100, f2:60, dur:0.1, vol:0.07}); },
+  parry(){ voice({type:'triangle', f:1500, f2:2200, dur:0.18, vol:0.07, rev:0.4}); voice({type:'sine', t:0.02, f:2400, dur:0.3, vol:0.04, rev:0.6}); noiz({type:'highpass', f:4000, dur:0.1, vol:0.06}); },
+  dash(){ noiz({f:600, f2:2800, dur:0.2, vol:0.06, q:1}); voice({type:'triangle', f:420, f2:140, dur:0.16, vol:0.03}); },
+  stomp(){ voice({type:'sine', f:120, f2:35, dur:0.3, vol:0.13}); noiz({type:'lowpass', f:260, dur:0.25, vol:0.09}); },
+  hook(){ for (let i = 0; i < 4; i++) voice({type:'square', t:i*0.04, f:rv(1800), f2:1200, dur:0.03, vol:0.025}); noiz({f:900, f2:3500, dur:0.22, vol:0.05, q:1.2}); },
+  heal(){ [392, 494, 587, 784].forEach((f, i) => voice({type:'sine', t:i*0.09, f, dur:0.6, vol:0.055, rev:0.7})); },
+  rage(){ voice({type:'sawtooth', f:70, f2:150, dur:0.5, vol:0.09, lp:600, vibD:8, vibR:14}); voice({type:'sawtooth', f:140, f2:300, dur:0.45, vol:0.04, lp:1500}); },
+  ghost(){ noiz({f:1200, f2:400, dur:0.5, vol:0.05, q:3, rev:0.6}); voice({type:'sine', f:300, f2:900, dur:0.5, vol:0.04, rev:0.8, vibD:15, vibR:8}); },
+  ability(){ voice({type:'triangle', f:300, f2:700, dur:0.14, vol:0.06}); },
+  combo(){ voice({type:'sawtooth', f:200, f2:600, dur:0.2, vol:0.05, lp:2000}); noiz({f:1800, f2:5000, dur:0.2, vol:0.05, q:1.5}); },
+  /* ---- враги ---- */
+  telegraph(){ voice({type:'sine', f:170, f2:260, dur:0.22, vol:0.04}); },
+  charge(){ voice({type:'sawtooth', f:85, f2:230, dur:0.32, vol:0.06, lp:700}); noiz({type:'lowpass', f:500, f2:1500, dur:0.3, vol:0.04}); },
+  slam(){ voice({type:'sine', f:95, f2:28, dur:0.36, vol:0.13}); noiz({type:'lowpass', f:200, dur:0.32, vol:0.1, rev:0.3}); },
+  ogreSmash(){ SFX.slam(); voice({type:'sawtooth', t:0.02, f:60, f2:35, dur:0.4, vol:0.06, lp:300}); noiz({t:0.05, type:'bandpass', f:140, dur:0.4, vol:0.07}); },
+  roar(){ voice({type:'sawtooth', f:115, f2:55, dur:0.65, vol:0.09, lp:700, vibD:5, vibR:11}); noiz({f:240, dur:0.5, vol:0.06, q:0.5}); },
+  boom(){ voice({type:'sine', f:105, f2:24, dur:0.5, vol:0.14}); noiz({type:'lowpass', f:260, dur:0.45, vol:0.11, rev:0.4}); },
+  shot(){ voice({type:'sawtooth', f:rv(720), f2:200, dur:0.13, vol:0.045, lp:2500}); },
+  bolt(){ voice({type:'sine', f:rv(500), f2:1100, dur:0.22, vol:0.05, rev:0.5, vibD:30, vibR:25}); },
+  bowDraw(){ noiz({f:600, f2:1300, dur:0.3, vol:0.025, q:4}); },
+  arrow(){ voice({type:'triangle', f:rv(200), f2:90, dur:0.12, vol:0.08}); noiz({type:'highpass', f:3500, dur:0.07, vol:0.05}); },
+  fuse(){ noiz({type:'highpass', f:3500, dur:0.18, vol:0.03, q:1}); },
+  spawn(){ voice({type:'sine', f:140, f2:420, dur:0.35, vol:0.04, rev:0.5}); noiz({f:700, f2:200, dur:0.3, vol:0.03, q:2}); },
+  necroRaise(){ voice({type:'sine', f:150, f2:420, dur:0.8, vol:0.06, rev:0.8, vibD:12, vibR:8}); for (let i = 0; i < 6; i++) voice({type:'triangle', t:0.2 + i*0.07, f:rv(600), f2:350, dur:0.05, vol:0.04}); noiz({f:900, f2:2500, dur:0.7, vol:0.03, q:3, rev:0.5}); },
+  necroShield(){ voice({type:'square', f:420, f2:380, dur:0.16, vol:0.03, voices:3, det:25, bp:1300, q:4, rev:0.5}); },
+  skeletonRattle(){ for (let i = 0; i < 3; i++) voice({type:'triangle', t:i*0.05, f:rv(850), f2:450, dur:0.04, vol:0.035}); },
+  /* ---- Двойник ---- */
+  doppelSlash(){ noiz({f:2500, f2:7000, dur:0.14, vol:0.05, q:2, rev:0.3}); voice({type:'sine', f:1400, f2:700, dur:0.16, vol:0.03, rev:0.6}); },
+  doppelWhirl(){ noiz({f:800, f2:5000, dur:0.4, vol:0.06, q:1.5, rev:0.5}); voice({type:'sine', f:200, f2:1200, dur:0.4, vol:0.05, rev:0.7}); },
+  doppelGuard(){ voice({type:'sine', f:1800, f2:1750, dur:0.5, vol:0.04, voices:3, det:30, rev:0.8}); },
+  glass(){ noiz({type:'highpass', f:4500, dur:0.5, vol:0.08, rev:0.5}); for (let i = 0; i < 10; i++) voice({type:'sine', t:Math.random()*0.35, f:2000 + Math.random()*3500, dur:0.18, vol:0.03, rev:0.6}); voice({type:'sine', f:90, f2:40, dur:0.3, vol:0.08}); },
+  /* ---- мир ---- */
+  portal(){ voice({type:'sine', f:180, f2:620, dur:0.9, vol:0.06, rev:0.6, vibD:14, vibR:6}); noiz({f:400, f2:3000, dur:0.9, vol:0.04, q:2, rev:0.5}); voice({type:'sawtooth', f:90, f2:200, dur:0.9, vol:0.03, lp:600}); },
+  gate(){ noiz({type:'lowpass', f:450, f2:200, dur:0.7, vol:0.08, q:0.7}); voice({type:'sine', t:0.55, f:70, f2:35, dur:0.3, vol:0.11}); },
+  roomClear(){ [392, 523, 659].forEach((f, i) => voice({type:'triangle', t:i*0.09, f, dur:0.55, vol:0.05, rev:0.6})); },
+  wave(){ voice({type:'sawtooth', f:130, f2:100, dur:0.55, vol:0.06, lp:500, rev:0.4}); voice({type:'sawtooth', t:0.05, f:196, f2:150, dur:0.5, vol:0.04, lp:600}); },
+  bossIntro(){ voice({type:'sine', f:70, f2:30, dur:1.2, vol:0.14}); voice({type:'sawtooth', t:0.2, f:110, f2:98, dur:1.4, vol:0.07, lp:500, rev:0.6, vibD:3, vibR:5}); noiz({type:'lowpass', f:200, dur:1.0, vol:0.08, rev:0.5}); },
+  chest(){ voice({type:'sawtooth', f:90, f2:140, dur:0.35, vol:0.04, lp:500}); [880, 1175, 1568].forEach((f, i) => voice({type:'triangle', t:0.25 + i*0.07, f, dur:0.3, vol:0.05, rev:0.5})); },
+  forge(){ voice({type:'square', f:880, dur:0.45, vol:0.04, voices:3, det:60, bp:1800, q:5, rev:0.4}); noiz({f:4000, dur:0.1, vol:0.07, q:2}); voice({type:'sine', f:80, f2:50, dur:0.15, vol:0.09}); },
+  altar(){ [110, 165, 220].forEach(f => voice({type:'sawtooth', f, dur:1.2, vol:0.035, lp:500, a:0.2, rev:0.8})); },
+  curse(){ voice({type:'sine', f:233, dur:1.0, vol:0.05, rev:0.9, a:0.1}); voice({type:'sine', f:247, dur:1.0, vol:0.05, rev:0.9, a:0.1}); noiz({f:1800, f2:600, dur:0.9, vol:0.025, q:5, rev:0.7}); },
+  merchant(){ [1568, 2093, 1760, 2349].forEach((f, i) => voice({type:'sine', t:i*0.06, f, dur:0.35, vol:0.035, rev:0.5})); },
+  step(){ noiz({type:'lowpass', f:rv(420, 0.3), dur:0.06, vol:0.03}); voice({type:'sine', f:rv(80), f2:55, dur:0.05, vol:0.03}); },
+  stepStone(){ noiz({type:'bandpass', f:rv(900, 0.3), dur:0.04, vol:0.025, q:2}); voice({type:'sine', f:rv(95), f2:60, dur:0.05, vol:0.025}); },
+  dummy(){ voice({type:'triangle', f:rv(160), f2:90, dur:0.1, vol:0.08}); noiz({type:'lowpass', f:700, dur:0.06, vol:0.05}); },
+  menuStart(){ voice({type:'sine', f:110, f2:55, dur:0.8, vol:0.13, rev:0.5}); [220, 330, 440].forEach((f, i) => voice({type:'sawtooth', t:i*0.05, f, dur:0.9, vol:0.03, lp:900, rev:0.6})); }
+};
+const _SFX_MIN = { step:0.18, stepStone:0.18, hit:0.045, hitBone:0.045, hitArmor:0.045, click:0.03, skeletonRattle:0.12, coin:0.04, swing:0.05 };
+const _sfxLast = {};
+const SFX_CRIT = { death:1, killBoss:1, bossIntro:1, levelup:1, portal:1, boom:1, slam:1, roar:1, glass:1 };
+function sfx(kind, vol){
+  if (!soundOn) return;
+  if (!ensureAudio()) return;
+  try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch(e){ return; }
+  const fn = SFX[kind] || SFX.click;
+  const now = audioCtx.currentTime;
+  const minGap = _SFX_MIN[kind] != null ? _SFX_MIN[kind] : 0.025;
+  if (_sfxLast[kind] && now - _sfxLast[kind] < minGap) return;
+  if (_activeVoices > 56 && !SFX_CRIT[kind]) return;
+  _sfxLast[kind] = now;
+  try { fn(); } catch(e){}
+}
+/* звук оружия по текущему типу */
+function sfxSwing(weaponType){
+  const k = 'swing_' + ({ sword:'sword', axe:'axe', knife:'knife', hammer:'hammer', greatsword:'sword', greataxe:'axe', greathammer:'hammer', whip:'whip', claws:'claws' }[weaponType] || 'sword');
+  sfx(SFX[k] ? k : 'swing');
+}
+function sfxHitFor(e){
+  if (!e) return sfx('hit');
+  if (e.type === 'skeleton') return sfx('hitBone');
+  if (e.type === 'ogre' || e.type === 'doppel' || e.isBoss) return sfx('hitArmor');
+  return sfx('hit');
+}
+function sfxKillFor(e){
+  if (!e) return sfx('kill');
+  if (e.secret || e.isBoss || e.isElite) return sfx('killBoss');
+  if (e.type === 'skeleton') return sfx('killBone');
+  if (e.type === 'ogre') return sfx('killOgre');
+  if (e.type === 'necro') return sfx('killNecro');
+  if (e.type === 'bomber') return sfx('boom');
+  return sfx('kill');
+}
+
+/* ---------- МУЗЫКА (процедурная, у каждого места свой трек) ---------- */
+function midiF(n){ return 440 * Math.pow(2, (n - 69) / 12); }
+const SCALES = {
+  minor:[0,2,3,5,7,8,10], harm:[0,2,3,5,7,8,11], phryg:[0,1,3,5,7,8,10], dor:[0,2,3,5,7,9,10],
+  lyd:[0,2,4,6,7,9,11], loc:[0,1,3,5,6,8,10], whole:[0,2,4,6,8,10,12], dim:[0,2,3,5,6,8,9], pdom:[0,1,4,5,7,8,10]
+};
+/* pat: 16 шагов, 'x' — удар, 'X' — акцент, '.' — пауза */
+const MUSIC_DEFS = {
+  menu:   { bpm:70, root:38, scale:'harm', prog:[0,5,3,4,0,5,6,4], seed:3,
+            pad:{wave:'sawtooth', vol:0.05, lp:900}, bass:{pat:'x...............', wave:'sine', vol:0.12},
+            lead:{wave:'triangle', vol:0.05, dens:0.2, oct:2, rev:0.9, min:0}, bell:{pat:'x.......x.......', vol:0.04, oct:2, min:0},
+            drums:{k:'x...............', t:'........x.......', min:0.6}, drone:{vol:0.05}, amb:'wind' },
+  lobby:  { bpm:92, root:45, scale:'dor', prog:[0,6,5,6,0,3,5,4], seed:7,
+            pad:{wave:'triangle', vol:0.06, lp:1400}, bass:{pat:'x..x..x.x..x..x.', wave:'triangle', vol:0.1},
+            arp:{pat:'x.x.x.x.x.x.x.x.', wave:'triangle', vol:0.04, oct:1, rev:0.4, min:0},
+            lead:{wave:'sine', vol:0.05, dens:0.35, oct:2, rev:0.6, min:0.2, vib:1},
+            drums:{k:'x.......x.......', s:'....x.......x...', h:'..x...x...x...x.', min:0.5}, amb:'fire' },
+  shop:   { bpm:84, root:50, scale:'lyd', prog:[0,4,3,4,0,5,3,1], seed:12,
+            pad:{wave:'sine', vol:0.06, lp:1800}, bass:{pat:'x.......x.......', wave:'sine', vol:0.08},
+            arp:{pat:'x..x..x.x..x..x.', wave:'sine', vol:0.05, oct:2, rev:0.7, min:0, box:1},
+            lead:{wave:'sine', vol:0.04, dens:0.25, oct:3, rev:0.8, min:0, box:1}, drums:null, amb:'coins' },
+  /* этажи — по темам */
+  f0:     { bpm:78, root:36, scale:'phryg', prog:[0,5,3,4,0,6,3,1], seed:21,
+            pad:{wave:'sawtooth', vol:0.05, lp:650}, bass:{pat:'x.......x.......', wave:'sine', vol:0.13},
+            lead:{wave:'sine', vol:0.045, dens:0.16, oct:2, rev:1, min:0.3}, bell:{pat:'........x.......', vol:0.035, oct:2, min:0.3},
+            drums:{k:'x.....x.........', t:'........x.......', min:0.7}, drone:{vol:0.05}, amb:'wind' },
+  f1:     { bpm:96, root:41, scale:'dor', prog:[0,3,5,4,0,6,5,4], seed:33,
+            pad:{wave:'triangle', vol:0.045, lp:1100}, bass:{pat:'x..x..x...x.x...', wave:'triangle', vol:0.1},
+            arp:{pat:'..x...x...x...x.', wave:'square', vol:0.025, oct:1, rev:0.3, min:0.4},
+            lead:{wave:'triangle', vol:0.05, dens:0.3, oct:2, rev:0.5, min:0.4},
+            drums:{k:'x.......x.......', s:'....x.......x...', h:'x.x.x.x.x.x.x.x.', min:0.7, bone:1}, amb:'drip' },
+  f2:     { bpm:72, root:40, scale:'harm', prog:[0,5,3,4,0,3,6,4], seed:44,
+            pad:{wave:'organ', vol:0.06, lp:1600}, bass:{pat:'x...............', wave:'sine', vol:0.12},
+            choir:{pat:'x...............', vol:0.05, min:0.3}, lead:{wave:'sine', vol:0.05, dens:0.2, oct:3, rev:1, min:0.4, vib:1},
+            bell:{pat:'x.......x.......', vol:0.04, oct:2, min:0}, drums:{k:'x.......x.......', t:'....x.......x...', min:0.7}, amb:'wind' },
+  f3:     { bpm:88, root:37, scale:'loc', prog:[0,1,5,4,0,6,1,5], seed:55,
+            pad:{wave:'sawtooth', vol:0.04, lp:600, wob:1}, bass:{pat:'x.x...x..x.x....', wave:'sawtooth', vol:0.08, lp:380},
+            arp:{pat:'.x..x.x..x...x..', wave:'sine', vol:0.04, oct:2, rev:0.7, min:0.2, rand:1},
+            lead:{wave:'triangle', vol:0.04, dens:0.18, oct:2, rev:0.9, min:0.5}, drums:{k:'x.....x.x.......', s:'........x.......', min:0.7}, amb:'bubble' },
+  f4:     { bpm:100, root:43, scale:'lyd', prog:[0,5,3,6,0,4,5,1], seed:66,
+            pad:{wave:'sine', vol:0.07, lp:2200}, bass:{pat:'x.......x.......', wave:'sine', vol:0.1},
+            arp:{pat:'x.x.x.x.x.x.x.x.', wave:'sine', vol:0.045, oct:3, rev:0.9, min:0, bellArp:1},
+            lead:{wave:'triangle', vol:0.04, dens:0.25, oct:3, rev:0.9, min:0.4}, drums:{k:'x.......x.......', h:'..x...x...x...x.', min:0.7}, amb:'wind' },
+  f5:     { bpm:112, root:38, scale:'pdom', prog:[0,0,5,4,0,0,6,4], seed:77,
+            pad:{wave:'sawtooth', vol:0.04, lp:800}, bass:{pat:'x.xx.x.xx.xx.x.x', wave:'sawtooth', vol:0.09, lp:520},
+            lead:{wave:'square', vol:0.03, dens:0.3, oct:2, rev:0.3, min:0.5, lp:2200},
+            drums:{k:'x...x...x...x...', s:'........x.......', min:0.5}, perc:{pat:'..x...x...x...x.', kind:'anvil', vol:0.05, min:0.5}, amb:'sparks' },
+  f6:     { bpm:104, root:39, scale:'harm', prog:[0,5,3,4,0,6,3,4], seed:88,
+            pad:{wave:'organ', vol:0.05, lp:1500}, bass:{pat:'x.x.x.x.x.x.x.x.', wave:'sawtooth', vol:0.07, lp:500},
+            arp:{pat:'xxxxxxxxxxxxxxxx', wave:'sawtooth', vol:0.022, oct:2, rev:0.3, min:0.4, lp:2600},
+            choir:{pat:'x...............', vol:0.04, min:0.5}, lead:{wave:'sawtooth', vol:0.03, dens:0.28, oct:2, rev:0.5, min:0.6, lp:2200},
+            drums:{k:'x.......x.......', s:'....x.......x...', h:'x.x.x.x.x.x.x.x.', min:0.7}, amb:'wind' },
+  f7:     { bpm:62, root:33, scale:'whole', prog:[0,2,4,1,0,3,5,2], seed:99,
+            pad:{wave:'sawtooth', vol:0.06, lp:500}, bass:{pat:'x...............', wave:'sine', vol:0.16},
+            lead:{wave:'sine', vol:0.045, dens:0.12, oct:3, rev:1, min:0.4, vib:1}, bell:{pat:'........x.......', vol:0.04, oct:3, min:0.4},
+            drums:{k:'x.x.............', t:'....x...........', min:0.5}, drone:{vol:0.07}, amb:'wind' },
+  boss:   { bpm:140, root:36, scale:'phryg', prog:[0,0,5,4,0,0,6,1], seed:111,
+            pad:{wave:'sawtooth', vol:0.05, lp:1000}, bass:{pat:'xx.xx.x.xx.xx.x.', wave:'sawtooth', vol:0.1, lp:560},
+            choir:{pat:'x.......x.......', vol:0.06, min:0}, lead:{wave:'sawtooth', vol:0.04, dens:0.45, oct:2, rev:0.4, min:0, lp:2600},
+            drums:{k:'x.x.x.x.x.x.x.x.', s:'....X.......X...', h:'xxxxxxxxxxxxxxxx', t:'..............x.', min:0}, perc:{pat:'x...............', kind:'taiko', vol:0.09, min:0}, amb:null },
+  doppel: { bpm:120, root:35, scale:'dim', prog:[0,3,0,6,0,4,1,5], seed:222,
+            pad:{wave:'sawtooth', vol:0.045, lp:1100, wob:1}, bass:{pat:'x..x..x..x..x...', wave:'square', vol:0.07, lp:420},
+            arp:{pat:'x.x.x.x.x.x.x.x.', wave:'triangle', vol:0.035, oct:2, rev:0.7, min:0, mirror:1},
+            lead:{wave:'sawtooth', vol:0.035, dens:0.4, oct:2, rev:0.7, min:0, lp:2400, mirror:1},
+            drums:{k:'x...x...x...x..x', s:'....x.......x...', h:'..x...x...x...x.', min:0}, perc:{pat:'x.......x.......', kind:'bell', vol:0.045, min:0}, amb:'glass' },
+  dead:   { bpm:58, root:38, scale:'minor', prog:[0,5,2,4,0,5,3,4], seed:5,
+            pad:{wave:'triangle', vol:0.06, lp:900}, bass:{pat:'x...............', wave:'sine', vol:0.1},
+            lead:{wave:'sine', vol:0.05, dens:0.15, oct:2, rev:1, min:0, vib:1}, bell:{pat:'x...............', vol:0.04, oct:2, min:0}, drums:null, amb:'wind' },
+  loading:{ bpm:80, root:34, scale:'minor', prog:[0,0,0,0,5,5,4,4], seed:9,
+            pad:{wave:'sawtooth', vol:0.05, lp:700}, bass:{pat:'x...x...x...x...', wave:'sine', vol:0.1},
+            drums:{k:'x...x...x...x...', min:0}, drone:{vol:0.06}, amb:'wind' }
+};
+const BOSS_VARIANT_SCALES = ['phryg','harm','loc','pdom','dim','phryg','harm','whole'];
+const _trackCache = {};
+function getTrackDef(name){
+  if (_trackCache[name]) return _trackCache[name];
+  let d;
+  if (name.indexOf('boss:') === 0){
+    const kind = name.slice(5), ix = Math.max(0, (typeof BOSS_ORDER !== 'undefined' ? BOSS_ORDER.indexOf(kind) : 0));
+    d = Object.assign({}, MUSIC_DEFS.boss, { root: 34 + (ix * 3) % 9, scale: BOSS_VARIANT_SCALES[ix % 8], bpm: 128 + (ix % 4) * 6, seed: 300 + ix * 17 });
+  } else d = MUSIC_DEFS[name] || MUSIC_DEFS.menu;
+  d = Object.assign({}, d);
+  d.melody = buildMelody(d);
+  _trackCache[name] = d;
+  return d;
+}
+function buildMelody(d){
+  const rnd = mulberry32(d.seed * 7919 + 13);
+  const dens = d.lead ? d.lead.dens : 0.2;
+  const bars = [];
+  let idx = 7 + 2;
+  for (let b = 0; b < d.prog.length; b++){
+    const bar = new Array(16).fill(null);
+    const chordRoot = d.prog[b];
+    for (let s = 0; s < 16; s += 2){
+      const strong = s % 4 === 0;
+      if (rnd() > (strong ? dens * 2.2 : dens * 1.1)) continue;
+      if (strong && rnd() < 0.6) idx = chordRoot + 7 + [0, 2, 4][Math.floor(rnd() * 3)];
+      else idx += Math.floor(rnd() * 3) - 1 + (rnd() < 0.15 ? (rnd() < 0.5 ? -2 : 2) : 0);
+      idx = clamp(idx, 5, 16);
+      bar[s] = idx;
+      if (rnd() < 0.2 && s < 15) bar[s + 1] = idx;
+    }
+    bars.push(bar);
+  }
+  return bars;
+}
+function scaleNote(d, idx){
+  const sc = SCALES[d.scale], n = sc.length;
+  const oct = Math.floor(idx / n), i = ((idx % n) + n) % n;
+  return d.root + sc[i] + 12 * oct;
+}
+let musicCur = null;       // { name, def, gain, step, nextT }
+let musicIntensity = 0.5;
+function wantedTrack(){
+  if (gameState === 'loading') return 'loading';
+  if (gameState === 'gameover') return 'dead';
+  if (gameState === 'menu' || gameState === 'settings' || gameState === 'combos' || gameState === 'hudedit') return 'menu';
+  if (shopOpen || wardrobeOpen || forgeOpen || altarOpen) return gameState === 'dungeon' ? null : 'shop';
+  if (gameState === 'lobby') return 'lobby';
+  if (gameState === 'dungeon'){
+    if (currentBoss && currentBoss.hp > 0) return currentBoss.secret ? 'doppel' : 'boss:' + (currentBoss.bossKind || 'x');
+    return 'f' + (((floor || 1) - 1) % 8);
+  }
+  return 'menu';
+}
+function targetIntensity(name){
+  if (name === 'menu' || name === 'lobby') return 0.75;
+  if (name === 'shop') return 0.5;
+  if (name === 'dead' || name === 'loading') return 0.6;
+  if (name === 'doppel' || name.indexOf('boss:') === 0) return 1;
+  if (gameState === 'dungeon'){
+    for (let i = 0; i < enemies.length; i++) if (enemies[i].hp > 0 && enemies[i].spawnTime <= 0 && !enemies[i].noLoot) return 0.9;
+    return 0.38;
+  }
+  return 0.5;
+}
+function startTrack(name){
+  const t = audioCtx.currentTime;
+  if (musicCur){
+    const old = musicCur;
+    old.gain.gain.cancelScheduledValues(t); old.gain.gain.setValueAtTime(old.gain.gain.value, t);
+    old.gain.gain.linearRampToValueAtTime(0.0001, t + 1.4);
+    setTimeout(() => { try { old.gain.disconnect(); } catch(e){} }, 2200);
+  }
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(1, t + 1.2);
+  g.connect(musicBus);
+  const def = getTrackDef(name);
+  musicCur = { name, def, gain: g, step: 0, nextT: t + 0.12 };
+}
+function updateMusic(dt){
+  if (!soundOn){ if (musicCur && audioCtx){ try { musicCur.gain.disconnect(); } catch(e){} musicCur = null; } return; }
+  if (!ensureAudio()) return;
+  if (audioCtx.state !== 'running') return;
+  let want = wantedTrack();
+  if (want === null) want = musicCur ? musicCur.name : 'menu';
+  if (!musicCur || musicCur.name !== want) startTrack(want);
+  musicIntensity += (targetIntensity(want) - musicIntensity) * Math.min(1, dt * 1.5);
+  const m = musicCur, d = m.def, stepDur = 60 / d.bpm / 4;
+  const now = audioCtx.currentTime;
+  if (m.nextT < now - 0.5) m.nextT = now + 0.05;
+  while (m.nextT < now + 0.25){
+    scheduleMusicStep(m, m.step, m.nextT - now);
+    m.nextT += stepDur; m.step++;
+  }
+}
+function mvoice(m, o){ o.bus = m.gain; o.t = Math.max(0, o.t || 0); voice(o); }
+function mnoiz(m, o){ o.bus = m.gain; o.t = Math.max(0, o.t || 0); noiz(o); }
+function scheduleMusicStep(m, step, dt0){
+  const d = m.def, I = musicIntensity, s = step % 16, bar = Math.floor(step / 16) % d.prog.length;
+  const chord = d.prog[bar], stepDur = 60 / d.bpm / 4, barDur = stepDur * 16;
+  const on = (L) => L && I >= (L.min || 0);
+  const hit = (pat) => pat && pat[s] && pat[s] !== '.';
+  const base = chord + 7;
+  /* вступление такта: фон, дрон, окружение */
+  if (s === 0){
+    const P = d.pad;
+    if (P){
+      for (const off of [0, 2, 4]){
+        const f = midiF(scaleNote(d, base + off) + 12);
+        if (P.wave === 'organ'){
+          for (const h of [1, 2, 3]) mvoice(m, { t:dt0, type:'sine', f:f*h, dur:barDur*1.05, a:0.5, hold:barDur*0.8, vol:P.vol/(h*1.2), lp:P.lp, rev:0.5 });
+        } else {
+          mvoice(m, { t:dt0, type:P.wave, f, dur:barDur*1.1, a:0.7, hold:barDur*0.85, vol:P.vol*0.5, lp:P.lp, lp2:P.wob ? P.lp*0.35 : P.lp, voices:2, det:9, rev:0.55 });
+        }
+      }
+    }
+    if (d.drone) mvoice(m, { t:dt0, type:'sine', f:midiF(d.root - 12), dur:barDur*1.1, a:0.8, hold:barDur*0.8, vol:d.drone.vol, rev:0.3 });
+    if (d.amb === 'wind') mnoiz(m, { t:dt0, f:300, f2:900, dur:barDur, a:barDur*0.5, vol:0.025, q:2, rev:0.5 });
+    if (d.amb === 'fire') mnoiz(m, { t:dt0, type:'lowpass', f:600, dur:barDur, a:barDur*0.3, vol:0.012, q:0.5 });
+  }
+  /* бас */
+  if (d.bass && on(d.bass) && hit(d.bass.pat)){
+    const f = midiF(scaleNote(d, chord) - 12 + (d.bass.oct || 0));
+    mvoice(m, { t:dt0, type:d.bass.wave, f, dur:stepDur*2.4, a:0.006, vol:d.bass.vol, lp:d.bass.lp || 900, rev:0.1 });
+  }
+  /* арпеджио */
+  if (d.arp && on(d.arp) && hit(d.arp.pat)){
+    const seq = [0, 2, 4, 7, 4, 2], k = d.arp.rand ? Math.floor(Math.random() * 6) : (step >> 1) % 6;
+    const note = scaleNote(d, base + seq[k]) + 12 * (d.arp.oct || 0);
+    if (d.arp.bellArp || d.arp.box){
+      mvoice(m, { t:dt0, type:'sine', f:midiF(note + 12), dur:0.7, vol:d.arp.vol, rev:d.arp.rev });
+      mvoice(m, { t:dt0, type:'sine', f:midiF(note + 12) * 2.76, dur:0.25, vol:d.arp.vol * 0.35, rev:d.arp.rev });
+    } else mvoice(m, { t:dt0, type:d.arp.wave, f:midiF(note), dur:stepDur*1.6, vol:d.arp.vol, lp:d.arp.lp || 2200, rev:d.arp.rev });
+  }
+  /* мелодия */
+  if (d.lead && on(d.lead)){
+    const ix = d.melody[bar][s];
+    if (ix !== null){
+      const L = d.lead, note = scaleNote(d, ix) + 12 * (L.oct - 2);
+      const dur = stepDur * (L.box ? 4 : 3.2);
+      const base2 = { t:dt0, type:L.wave, f:midiF(note), dur, a:L.box ? 0.003 : 0.02, vol:L.vol, lp:L.lp || 3000, rev:L.rev, vibD:L.vib ? 4 : 0, vibR:5 };
+      mvoice(m, base2);
+      if (L.mirror){
+        const mi = scaleNote(d, 14 - ix + chord) + 12 * (L.oct - 3);
+        mvoice(m, { t:dt0 + stepDur*1.5, type:'square', f:midiF(mi), dur, a:0.02, vol:L.vol * 0.55, lp:1500, rev:0.9 });
+      }
+    }
+  }
+  /* колокол / хор / перкуссия */
+  if (d.bell && on(d.bell) && hit(d.bell.pat)){
+    const f = midiF(scaleNote(d, base + [0, 2, 4][bar % 3]) + 12 * (d.bell.oct || 2));
+    mvoice(m, { t:dt0, type:'sine', f, dur:1.6, vol:d.bell.vol, rev:0.8 });
+    mvoice(m, { t:dt0, type:'sine', f:f*2.76, dur:0.5, vol:d.bell.vol*0.3, rev:0.8 });
+  }
+  if (d.choir && on(d.choir) && hit(d.choir.pat)){
+    for (const off of [0, 2, 4]){
+      const f = midiF(scaleNote(d, base + off) + 12);
+      mvoice(m, { t:dt0, type:'sawtooth', f, dur:stepDur*7, a:0.12, hold:stepDur*3, vol:d.choir.vol*0.5, bp:900, bp2:650, q:3, voices:2, det:14, rev:0.8 });
+    }
+  }
+  if (d.perc && on(d.perc) && hit(d.perc.pat)){
+    const P = d.perc;
+    if (P.kind === 'anvil'){
+      mvoice(m, { t:dt0, type:'square', f:rv(1040), dur:0.4, vol:P.vol, voices:2, det:55, bp:2100, q:4, rev:0.3 });
+      mnoiz(m, { t:dt0, f:5000, dur:0.06, vol:P.vol*1.2, q:2 });
+    } else if (P.kind === 'taiko'){
+      mvoice(m, { t:dt0, type:'sine', f:95, f2:45, dur:0.45, vol:P.vol*1.4 });
+      mnoiz(m, { t:dt0, type:'lowpass', f:420, dur:0.25, vol:P.vol, rev:0.3 });
+    } else if (P.kind === 'bell'){
+      mvoice(m, { t:dt0, type:'sine', f:midiF(d.root + 36), dur:1.2, vol:P.vol, rev:0.9 });
+      mvoice(m, { t:dt0, type:'sine', f:midiF(d.root + 36 + 6), dur:1.0, vol:P.vol*0.7, rev:0.9 });
+    }
+  }
+  /* ударные */
+  if (d.drums && on(d.drums)){
+    const D = d.drums;
+    if (hit(D.k)){ mvoice(m, { t:dt0, type:'sine', f:150, f2:42, dur:0.16, vol:(D.k[s] === 'X' ? 0.2 : 0.16) }); mnoiz(m, { t:dt0, type:'lowpass', f:200, dur:0.03, vol:0.05 }); }
+    if (hit(D.s)){ mnoiz(m, { t:dt0, f:1900, dur:0.14, vol:0.06, q:0.8, rev:0.2 }); mvoice(m, { t:dt0, type:'triangle', f:200, f2:140, dur:0.1, vol:0.06 }); }
+    if (hit(D.h)){ if (D.bone) mvoice(m, { t:dt0, type:'triangle', f:rv(1200), f2:700, dur:0.03, vol:0.022 }); else mnoiz(m, { t:dt0, type:'highpass', f:7000, dur:0.03, vol:0.015 + (s % 4 === 2 ? 0.006 : 0), q:0.6 }); }
+    if (hit(D.t)){ mvoice(m, { t:dt0, type:'sine', f:110, f2:60, dur:0.3, vol:0.1, rev:0.4 }); }
+  }
+  /* окружение */
+  if (d.amb === 'drip' && Math.random() < 0.05) mvoice(m, { t:dt0, type:'sine', f:rv(1300, 0.4), f2:700, dur:0.12, vol:0.03, rev:0.8 });
+  if (d.amb === 'bubble' && Math.random() < 0.08) mvoice(m, { t:dt0, type:'sine', f:rv(220, 0.4), f2:520, dur:0.1, vol:0.03, rev:0.4 });
+  if (d.amb === 'sparks' && Math.random() < 0.08) mnoiz(m, { t:dt0, type:'highpass', f:5000, dur:0.03, vol:0.02 });
+  if (d.amb === 'glass' && Math.random() < 0.06) mvoice(m, { t:dt0, type:'sine', f:rv(3200, 0.5), dur:0.4, vol:0.015, rev:0.9 });
+  if (d.amb === 'coins' && Math.random() < 0.03) mvoice(m, { t:dt0, type:'sine', f:rv(2400, 0.3), dur:0.25, vol:0.012, rev:0.7 });
+  if (d.amb === 'fire' && Math.random() < 0.1) mnoiz(m, { t:dt0, type:'highpass', f:3500, dur:0.025, vol:0.012 });
+}
+const _unlockAudio = () => { try { if (ensureAudio() && audioCtx.state === 'suspended') audioCtx.resume(); } catch(e){} };
+window.addEventListener('pointerdown', _unlockAudio);
+window.addEventListener('keydown', _unlockAudio);
+
+const bodyGradCache = {};
+const dotCache = {};
+function getDotSprite(color){
+  if (!dotCache[color]){
+    const c = document.createElement('canvas'); c.width = 32; c.height = 32;
+    const g = c.getContext('2d');
+    g.fillStyle = color;
+    g.beginPath(); g.arc(16, 16, 14, 0, TAU); g.fill();
+    dotCache[color] = c;
+  }
+  return dotCache[color];
+}
+
+const auraCache = {};
+function makeAuraSprite(color, size){
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const cx = c.getContext('2d');
+  const g = cx.createRadialGradient(size/2, size/2, 2, size/2, size/2, size/2);
+  g.addColorStop(0, hexA(color, 0.5));
+  g.addColorStop(0.55, hexA(color, 0.15));
+  g.addColorStop(1, hexA(color, 0));
+  cx.fillStyle = g;
+  cx.fillRect(0, 0, size, size);
+  return c;
+}
+function initAuraSprites(){
+  const colors = ['#c8c8d8','#7bff8a','#ffd166','#ff2b45','#b04bff','#ff7b1a','#ff0033','#ffaa00','#ff55ff','#5ad7ff'];
+  for (const c of colors){ if (!auraCache[c]) auraCache[c] = makeAuraSprite(c, 128); }
+}
+
+const iconCache = {};
+function makeIcon(key, s) {
+  const c = document.createElement('canvas');
+  c.width = s; c.height = s;
+  const g = c.getContext('2d');
+  g.translate(s/2, s/2);
+
+  const drawPotion = (color, dark) => {
+    const w = s*0.55, h = s*0.8, nw = w*0.35, nh = h*0.22, br = w*0.5;
+    const bcy = -h/2 + nh + br*0.85;
+    g.fillStyle = 'rgba(180,210,230,0.3)';
+    g.fillRect(-nw/2, -h/2, nw, nh);
+    g.beginPath(); g.arc(0, bcy, br, 0, TAU); g.fill();
+    g.save();
+    g.beginPath(); g.arc(0, bcy, br*0.92, 0, TAU); g.clip();
+    g.fillStyle = color; g.fillRect(-br, bcy - br*0.3, br*2, br*1.5);
+    g.fillStyle = dark; g.fillRect(-br, bcy + br*0.4, br*2, br*0.8);
+    g.restore();
+    g.strokeStyle = 'rgba(200,220,240,0.8)';
+    g.lineWidth = Math.max(1, s*0.03);
+    g.beginPath(); g.arc(0, bcy, br, 0, TAU); g.stroke();
+    g.strokeRect(-nw/2, -h/2, nw, nh);
+    g.fillStyle = '#8a6a3a';
+    g.fillRect(-nw/2 - 2, -h/2 - s*0.08, nw + 4, s*0.08);
+    g.fillStyle = 'rgba(255,255,255,0.5)';
+    g.beginPath();
+    g.ellipse(-br*0.4, bcy - br*0.35, br*0.12, br*0.25, -0.3, 0, TAU);
+    g.fill();
+  };
+  const drawKnife = (color) => {
+    g.rotate(-Math.PI/4);
+    g.fillStyle = color;
+    g.beginPath();
+    g.moveTo(-s*0.15, -s*0.05); g.lineTo(s*0.35, -s*0.02);
+    g.lineTo(s*0.4, 0); g.lineTo(s*0.35, s*0.02);
+    g.lineTo(-s*0.15, s*0.05);
+    g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = 1; g.stroke();
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.4, -s*0.06, s*0.25, s*0.12);
+  };
+  const drawAxe = (color) => {
+    g.rotate(-Math.PI/5);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.05, -s*0.4, s*0.1, s*0.8);
+    g.fillStyle = color;
+    g.beginPath();
+    g.moveTo(-s*0.05, -s*0.35); g.lineTo(s*0.3, -s*0.25);
+    g.lineTo(s*0.35, 0); g.lineTo(s*0.3, s*0.05);
+    g.lineTo(-s*0.05, -s*0.05);
+    g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = 1; g.stroke();
+  };
+  const drawSword = (color, guard) => {
+    g.rotate(-Math.PI/4);
+    g.fillStyle = color;
+    g.beginPath();
+    g.moveTo(0, -s*0.4); g.lineTo(s*0.08, s*0.15);
+    g.lineTo(0, s*0.2); g.lineTo(-s*0.08, s*0.15);
+    g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = 1; g.stroke();
+    g.fillStyle = guard;
+    g.fillRect(-s*0.2, s*0.18, s*0.4, s*0.06);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.04, s*0.24, s*0.08, s*0.15);
+    g.fillStyle = guard;
+    g.beginPath(); g.arc(0, s*0.42, s*0.04, 0, TAU); g.fill();
+  };
+  const drawScythe = (color) => {
+    g.rotate(-Math.PI/5);
+    g.strokeStyle = '#5a3820'; g.lineWidth = s*0.08; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(0, -s*0.4); g.lineTo(0, s*0.4); g.stroke();
+    g.strokeStyle = color; g.lineWidth = s*0.1; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(0, -s*0.35);
+    g.quadraticCurveTo(s*0.35, -s*0.4, s*0.4, -s*0.15);
+    g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,0.5)';
+    g.lineWidth = s*0.03; g.stroke();
+  };
+  const drawHammer = (color) => {
+    g.rotate(-Math.PI/6);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.05, -s*0.1, s*0.1, s*0.5);
+    g.fillStyle = color;
+    g.fillRect(-s*0.25, -s*0.35, s*0.5, s*0.25);
+    g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = 1;
+    g.strokeRect(-s*0.25, -s*0.35, s*0.5, s*0.25);
+    g.fillStyle = 'rgba(255,255,255,0.4)';
+    g.fillRect(-s*0.2, -s*0.3, s*0.4, s*0.04);
+  };
+  const drawWhip = (color) => {
+    g.strokeStyle = '#5a3820'; g.lineWidth = s*0.08;
+    g.beginPath(); g.moveTo(-s*0.4, s*0.2); g.lineTo(-s*0.15, s*0.1); g.stroke();
+    g.strokeStyle = color; g.lineWidth = s*0.05; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(-s*0.15, s*0.1);
+    g.bezierCurveTo(s*0.1, -s*0.3, s*0.3, s*0.3, s*0.45, -s*0.15);
+    g.stroke();
+    g.fillStyle = color;
+    g.beginPath(); g.arc(s*0.45, -s*0.15, s*0.05, 0, TAU); g.fill();
+  };
+  const drawClaws = (color) => {
+    g.fillStyle = color;
+    for (let i = -1; i <= 1; i++){
+      g.save();
+      g.rotate(i * 0.25);
+      g.beginPath();
+      g.moveTo(-s*0.2, -s*0.05);
+      g.lineTo(s*0.35, -s*0.03);
+      g.lineTo(s*0.4, 0);
+      g.lineTo(s*0.35, s*0.03);
+      g.lineTo(-s*0.2, s*0.05);
+      g.closePath(); g.fill();
+      g.restore();
+    }
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.35, -s*0.1, s*0.15, s*0.2);
+  };
+  const drawHelm = () => {
+    const r = s*0.35;
+    g.fillStyle = '#8a8a95';
+    g.beginPath();
+    g.arc(0, 0, r, Math.PI, 0);
+    g.lineTo(r, r*0.4); g.lineTo(-r, r*0.4);
+    g.closePath(); g.fill();
+    g.strokeStyle = '#3a3a45'; g.lineWidth = Math.max(1, s*0.04); g.stroke();
+    g.fillStyle = '#1a1a1a';
+    g.fillRect(-r*0.8, -r*0.1, r*1.6, r*0.15);
+    g.fillStyle = '#ff2b45';
+    g.beginPath(); g.ellipse(0, -r*0.9, r*0.15, r*0.25, 0, 0, TAU); g.fill();
+  };
+  const drawChest = () => {
+    const w = s*0.55, h = s*0.6;
+    g.fillStyle = '#8a8a95';
+    g.beginPath();
+    g.moveTo(-w*0.6, -h/2); g.lineTo(w*0.6, -h/2);
+    g.lineTo(w*0.4, h/2); g.lineTo(-w*0.4, h/2);
+    g.closePath(); g.fill();
+    g.strokeStyle = '#3a3a45'; g.lineWidth = Math.max(1, s*0.04); g.stroke();
+    g.strokeStyle = 'rgba(0,0,0,0.3)';
+    g.beginPath(); g.moveTo(0, -h/2); g.lineTo(0, h/2); g.stroke();
+  };
+  const drawBoots = () => {
+    const w = s*0.4, h = s*0.6;
+    g.fillStyle = '#5a3820';
+    g.beginPath();
+    g.moveTo(-w*0.5, -h/2); g.lineTo(w*0.2, -h/2);
+    g.lineTo(w*0.2, h*0.2); g.lineTo(w*0.7, h*0.3);
+    g.lineTo(w*0.7, h/2); g.lineTo(-w*0.5, h/2);
+    g.closePath(); g.fill();
+    g.strokeStyle = '#3a2010'; g.lineWidth = Math.max(1, s*0.04); g.stroke();
+  };
+  const drawShield = () => {
+    const w = s*0.55, h = s*0.7;
+    g.fillStyle = '#3a3a45';
+    g.beginPath();
+    g.moveTo(0, -h/2); g.lineTo(w/2, -h*0.3);
+    g.lineTo(w/2, h*0.1);
+    g.quadraticCurveTo(w/2, h*0.4, 0, h/2);
+    g.quadraticCurveTo(-w/2, h*0.4, -w/2, h*0.1);
+    g.lineTo(-w/2, -h*0.3);
+    g.closePath(); g.fill();
+    g.strokeStyle = '#d4a64a'; g.lineWidth = Math.max(1, s*0.05); g.stroke();
+    g.lineWidth = Math.max(1, s*0.04);
+    g.beginPath();
+    g.moveTo(0, -h*0.3); g.lineTo(0, h*0.3);
+    g.moveTo(-w*0.25, -h*0.05); g.lineTo(w*0.25, -h*0.05);
+    g.stroke();
+  };
+  const drawSoul = () => {
+    g.fillStyle = '#5ad7ff';
+    g.shadowColor = '#5ad7ff'; g.shadowBlur = s*0.2;
+    g.beginPath(); g.arc(0, 0, s*0.28, 0, TAU); g.fill();
+    g.shadowBlur = 0;
+    g.fillStyle = '#c8f0ff';
+    g.beginPath(); g.arc(-s*0.08, -s*0.08, s*0.1, 0, TAU); g.fill();
+  };
+  const drawCoin = () => {
+    g.fillStyle = '#ffd166';
+    g.shadowColor = '#ffd166'; g.shadowBlur = s*0.15;
+    g.beginPath(); g.arc(0, 0, s*0.3, 0, TAU); g.fill();
+    g.shadowBlur = 0;
+    g.strokeStyle = '#8a6a1a'; g.lineWidth = Math.max(1, s*0.04);
+    g.beginPath(); g.arc(0, 0, s*0.3, 0, TAU); g.stroke();
+    g.fillStyle = '#8a6a1a';
+    g.font = `bold ${Math.round(s*0.35)}px serif`;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('¤', 0, 1);
+  };
+
+  const drawGreatSword = () => {
+    g.rotate(-Math.PI/4);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.05, s*0.25, s*0.1, s*0.18);
+    g.fillStyle = '#c9a03a';
+    g.fillRect(-s*0.16, s*0.17, s*0.32, s*0.07);
+    g.fillStyle = '#dce5ee';
+    g.beginPath();
+    g.moveTo(-s*0.09, s*0.16); g.lineTo(-s*0.09, -s*0.3);
+    g.lineTo(0, -s*0.42); g.lineTo(s*0.09, -s*0.3); g.lineTo(s*0.09, s*0.16);
+    g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(90,110,130,0.9)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, s*0.12); g.lineTo(0, -s*0.36); g.stroke();
+    g.strokeStyle = 'rgba(0,0,0,0.45)'; g.beginPath();
+    g.moveTo(-s*0.09, s*0.16); g.lineTo(-s*0.09, -s*0.3); g.lineTo(0, -s*0.42);
+    g.lineTo(s*0.09, -s*0.3); g.lineTo(s*0.09, s*0.16); g.closePath(); g.stroke();
+  };
+  const drawGreatAxe = () => {
+    g.rotate(-Math.PI/5);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.05, -s*0.45, s*0.1, s*0.9);
+    g.fillStyle = '#b88a4a';
+    g.beginPath();
+    g.moveTo(-s*0.05, -s*0.38); g.quadraticCurveTo(-s*0.42, -s*0.3, -s*0.36, -s*0.02);
+    g.quadraticCurveTo(-s*0.18, -s*0.12, -s*0.05, -s*0.1); g.closePath(); g.fill();
+    g.beginPath();
+    g.moveTo(s*0.05, -s*0.38); g.quadraticCurveTo(s*0.42, -s*0.3, s*0.36, -s*0.02);
+    g.quadraticCurveTo(s*0.18, -s*0.12, s*0.05, -s*0.1); g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(0,0,0,0.45)'; g.lineWidth = 1; g.stroke();
+  };
+  const drawGreatHammer = () => {
+    g.rotate(-Math.PI/6);
+    g.fillStyle = '#5a3820';
+    g.fillRect(-s*0.06, -s*0.12, s*0.12, s*0.55);
+    g.fillStyle = '#8a8a95';
+    g.fillRect(-s*0.28, -s*0.42, s*0.56, s*0.3);
+    g.fillStyle = '#5a5a66';
+    g.fillRect(-s*0.28, -s*0.18, s*0.56, s*0.06);
+    g.fillStyle = 'rgba(255,255,255,0.35)';
+    g.fillRect(-s*0.24, -s*0.38, s*0.48, s*0.04);
+    g.strokeStyle = 'rgba(0,0,0,0.45)'; g.lineWidth = 1;
+    g.strokeRect(-s*0.28, -s*0.42, s*0.56, s*0.3);
+  };
+  if (key === 'healPotion') drawPotion('#ff2b45', '#8a0020');
+  else if (key === 'dmgPotion') drawPotion('#ff9933', '#aa4400');
+  else if (key === 'defPotion') drawPotion('#5ad7ff', '#0055aa');
+  else if (key === 'throwKnife') drawKnife('#dce5ee');
+  else if (key === 'throwAxe') drawAxe('#b88a4a');
+  else if (key === 'weapon_knife') drawKnife('#dce5ee');
+  else if (key === 'weapon_sword') drawSword('#dce5ee', '#d4a64a');
+  else if (key === 'weapon_goldSword') drawSword('#ffd166', '#c9a03a');
+  else if (key === 'weapon_axe') drawAxe('#b88a4a');
+  else if (key === 'weapon_scythe') drawScythe('#9a4ac9');
+  else if (key === 'weapon_hammer') drawHammer('#8a8a95');
+  else if (key === 'weapon_whip') drawWhip('#c9a03a');
+  else if (key === 'weapon_claws') drawClaws('#5ad7ff');
+  else if (key === 'weapon_greatsword') drawGreatSword();
+  else if (key === 'weapon_greataxe') drawGreatAxe();
+  else if (key === 'weapon_greathammer') drawGreatHammer();
+  else if (key.indexOf('helm') === 0) drawHelm();
+  else if (key.indexOf('chest') === 0) drawChest();
+  else if (key.indexOf('boots') === 0) drawBoots();
+  else if (key === 'soul') drawSoul();
+  else if (key === 'coin') drawCoin();
+  else if (key === 'ability_dash'){
+    g.strokeStyle = '#5ad7ff'; g.lineWidth = s*0.08; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(-s*0.25, 0); g.lineTo(s*0.2, 0); g.stroke();
+    g.beginPath(); g.moveTo(s*0.05, -s*0.18); g.lineTo(s*0.25, 0); g.lineTo(s*0.05, s*0.18); g.stroke();
+    g.strokeStyle = 'rgba(90,215,255,0.4)'; g.lineWidth = s*0.04;
+    g.beginPath(); g.moveTo(-s*0.3, -s*0.15); g.lineTo(-s*0.15, -s*0.15); g.stroke();
+    g.beginPath(); g.moveTo(-s*0.3, s*0.15); g.lineTo(-s*0.15, s*0.15); g.stroke();
+  }
+  else if (key === 'ability_stomp'){
+    g.strokeStyle = '#ff7b1a'; g.lineWidth = s*0.05;
+    for (let i = 1; i <= 3; i++){ g.beginPath(); g.arc(0, 0, s*0.12*i, 0, TAU); g.stroke(); }
+    g.fillStyle = '#ff7b1a';
+    g.beginPath(); g.arc(0, 0, s*0.08, 0, TAU); g.fill();
+  }
+  else if (key === 'ability_hook'){
+    g.strokeStyle = '#5ad7ff'; g.lineWidth = s*0.06; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(-s*0.3, -s*0.2); g.lineTo(s*0.15, s*0.1); g.stroke();
+    g.beginPath(); g.arc(s*0.15, s*0.15, s*0.15, -Math.PI*0.3, Math.PI*0.8); g.stroke();
+    g.fillStyle = '#5ad7ff';
+    g.beginPath(); g.arc(s*0.2, s*0.28, s*0.04, 0, TAU); g.fill();
+  }
+  else if (key === 'ability_heal'){
+    g.fillStyle = '#7bff8a';
+    g.fillRect(-s*0.08, -s*0.25, s*0.16, s*0.5);
+    g.fillRect(-s*0.25, -s*0.08, s*0.5, s*0.16);
+    g.strokeStyle = '#7bff8a'; g.lineWidth = s*0.03;
+    g.beginPath(); g.arc(0, 0, s*0.32, 0, TAU); g.stroke();
+  }
+  else if (key === 'ability_rage'){
+    g.fillStyle = '#ff2b45';
+    g.beginPath();
+    g.moveTo(0, -s*0.35); g.lineTo(s*0.2, -s*0.05);
+    g.lineTo(s*0.1, s*0.1); g.lineTo(s*0.25, s*0.3);
+    g.lineTo(-s*0.1, s*0.15); g.lineTo(-s*0.2, s*0.35);
+    g.lineTo(-s*0.15, s*0.05);
+    g.closePath(); g.fill();
+    g.fillStyle = '#ffd166';
+    g.beginPath();
+    g.moveTo(-s*0.02, -s*0.05); g.lineTo(s*0.08, s*0.1); g.lineTo(-s*0.05, s*0.22);
+    g.closePath(); g.fill();
+  }
+  else if (key === 'ability_parry'){
+    g.fillStyle = '#d4a64a';
+    g.beginPath();
+    g.moveTo(0, -s*0.3); g.lineTo(s*0.22, -s*0.15);
+    g.lineTo(s*0.22, s*0.1);
+    g.quadraticCurveTo(s*0.15, s*0.3, 0, s*0.35);
+    g.quadraticCurveTo(-s*0.15, s*0.3, -s*0.22, s*0.1);
+    g.lineTo(-s*0.22, -s*0.15);
+    g.closePath(); g.fill();
+    g.strokeStyle = '#ffd166'; g.lineWidth = s*0.04;
+    g.beginPath(); g.moveTo(-s*0.1, 0); g.lineTo(0, s*0.1); g.lineTo(s*0.12, -s*0.1); g.stroke();
+  }
+  else if (key === 'ability_ghost'){
+    g.fillStyle = 'rgba(176,75,255,0.8)';
+    g.beginPath(); g.arc(0, -s*0.05, s*0.25, Math.PI, 0);
+    g.lineTo(s*0.25, s*0.2); g.lineTo(s*0.1, s*0.1); g.lineTo(0, s*0.25);
+    g.lineTo(-s*0.1, s*0.1); g.lineTo(-s*0.25, s*0.2); g.closePath(); g.fill();
+    g.fillStyle = '#1a0a2a';
+    g.beginPath();
+    g.arc(-s*0.08, -s*0.05, s*0.04, 0, TAU);
+    g.arc(s*0.08, -s*0.05, s*0.04, 0, TAU);
+    g.fill();
+  }
+
+  g.globalCompositeOperation = 'source-atop';
+  const shine = g.createLinearGradient(-s/2, -s/2, s/2, s/2);
+  shine.addColorStop(0, 'rgba(255,255,255,0.20)');
+  shine.addColorStop(0.32, 'rgba(255,255,255,0.04)');
+  shine.addColorStop(0.45, 'rgba(255,255,255,0.16)');
+  shine.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = shine;
+  g.fillRect(-s/2, -s/2, s, s);
+  g.globalCompositeOperation = 'source-over';
+  return c;
+}
+function drawItemIcon(item, cx, cy, size) {
+  if (!item) return;
+  const key = item.templateKey;
+  if (!iconCache[key]) iconCache[key] = makeIcon(key, 64);
+  ctx.drawImage(iconCache[key], cx - size/2, cy - size/2, size, size);
+}
+function drawSpecialIcon(key, cx, cy, size) {
+  if (!iconCache[key]) iconCache[key] = makeIcon(key, 64);
+  ctx.drawImage(iconCache[key], cx - size/2, cy - size/2, size, size);
+}
+
+let floorPattern = null;
+function initFloorPattern(){
+  const T = 110;
+  const c = document.createElement('canvas');
+  c.width = T; c.height = T;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#150815';
+  cx.fillRect(0, 0, T, T);
+  cx.strokeStyle = 'rgba(0,0,0,0.25)';
+  cx.lineWidth = 1;
+  cx.beginPath();
+  cx.moveTo(0, T/2); cx.lineTo(T, T/2);
+  cx.moveTo(T/2, 0); cx.lineTo(T/2, T);
+  cx.stroke();
+  cx.strokeStyle = 'rgba(255,255,255,0.04)';
+  cx.beginPath();
+  cx.moveTo(0, T/2 + 1.5); cx.lineTo(T, T/2 + 1.5);
+  cx.moveTo(T/2 + 1.5, 0); cx.lineTo(T/2 + 1.5, T);
+  cx.stroke();
+  cx.strokeStyle = 'rgba(0,0,0,0.28)';
+  cx.lineWidth = 1.5;
+  cx.beginPath();
+  cx.moveTo(T * 0.2, T * 0.3);
+  cx.lineTo(T * 0.5, T * 0.55);
+  cx.lineTo(T * 0.45, T * 0.8);
+  cx.stroke();
+  cx.beginPath();
+  cx.moveTo(T * 0.72, T * 0.15);
+  cx.lineTo(T * 0.8, T * 0.38);
+  cx.lineTo(T * 0.68, T * 0.6);
+  cx.stroke();
+  for (let i = 0; i < 14; i++){
+    const px = (i * 37 + 13) % T, py = (i * 53 + 29) % T;
+    cx.fillStyle = i % 3 === 0 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.22)';
+    cx.fillRect(px, py, 2, 2);
+  }
+  cx.strokeStyle = 'rgba(70,25,50,0.15)';
+  cx.lineWidth = 1;
+  cx.strokeRect(1, 1, T - 2, T - 2);
+  floorPattern = ctx.createPattern(c, 'repeat');
+}
+/* ==================== ITEMS DATABASE ==================== */
+const RARITIES = {
+  common:    { name:'ОБЫЧНЫЙ',    color:'#c8c8d8', mult: 1.0 },
+  rare:      { name:'РЕДКИЙ',     color:'#5ad7ff', mult: 1.35 },
