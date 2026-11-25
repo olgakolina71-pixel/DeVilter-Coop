@@ -1609,7 +1609,7 @@ let mpRemotePlayers={}, mpLastPlayerSend=0, mpLastWorldSend=0, mpSeed=1, mpWorld
 function mpDisconnect(){ try{mpSocket?.close();}catch(e){} mpSocket=null; mpConnected=false; mpPlayers=[]; mpRemotePlayers={}; }
 function mpSeeded(seed){let x=(seed|0)||1;return()=>{x=(x*1664525+1013904223)>>>0;return x/4294967296;};}
 function mpSend(type,extra={}){if(mpSocket&&mpSocket.readyState===1)mpSocket.send(JSON.stringify({type,id:mpClientId,name:mpPlayerName,...extra}));}
-function mpPlayerSnapshot(){return player?{id:mpClientId,name:mpPlayerName,x:player.x,y:player.y,facing:player.facing||0,hp:player.hp,maxHp:player.maxHp,alive:player.hp>0,gameState, floor,downed:mpDowned}:null;}
+function mpPlayerSnapshot(){return player?{id:mpClientId,name:mpPlayerName,x:player.x,y:player.y,facing:player.facing||0,hp:player.hp,maxHp:player.maxHp,alive:player.hp>0&&!mpDowned,gameState,floor,downed:mpDowned,attackTime:player.attackTime||0,attackDur:player.attackDur||0,altTime:player.altTime||0,hurtFlash:player.hurtFlash||0}:null;}
 function mpFindRemote(id){return mpRemotePlayers[id]||mpPlayers.find(x=>x.id===id)||null;}
 function mpEsc(s){return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 function mpTradeModal(title,subtitle,content,buttons){const root=document.getElementById('coopTrade'),panel=document.getElementById('coopTradePanel');if(!root||!panel)return;panel.innerHTML='<h2>'+mpEsc(title)+'</h2><div class="sub">'+mpEsc(subtitle)+'</div>'+content+'<div class="buttons">'+buttons+'</div>';root.classList.add('open');root.onclick=e=>{if(e.target===root)mpTradeClose();};panel.querySelectorAll('[data-trade-close]').forEach(b=>b.onclick=mpTradeClose);}
@@ -8821,8 +8821,6 @@ function loop(now){
       if (hitStop > 0) hitStop -= dt;
       else update(dt);
     } else if(gameState==='downed'){mpUpdate(dt);updateParticles(dt);updateFloaters(dt);updateCamera(dt);
-      if (hitStop > 0) hitStop -= dt;
-      else update(dt);
     } else {
       updateAmbient(dt);
       if (gameState === 'gameover') gameOverTimer += dt;
