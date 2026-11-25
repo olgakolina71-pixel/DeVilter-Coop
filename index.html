@@ -8520,7 +8520,9 @@ function render(){
   } else if (gameState === 'dungeon'){
     renderDungeon();
     if (paused) renderPause(); else drawHUD();
-  } else if (gameState === 'downed'){\n    renderDungeon();drawHUD();ctx.save();ctx.fillStyle='rgba(55,0,12,.42)';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#ff6379';ctx.font='bold 26px Georgia,serif';ctx.fillText('ПОВАЛЕН',W/2,H*.22);ctx.fillStyle='#fff';ctx.font='bold 13px system-ui';ctx.fillText('Нажми R или HELP — позови союзника',W/2,H*.27);ctx.restore();\n  } else if (gameState === 'gameover'){
+  } else if (gameState === 'downed'){
+    renderDungeon();drawHUD();ctx.save();ctx.fillStyle='rgba(55,0,12,.42)';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#ff6379';ctx.font='bold 26px Georgia,serif';ctx.fillText('ПОВАЛЕН',W/2,H*.22);ctx.fillStyle='#fff';ctx.font='bold 13px system-ui';ctx.fillText('Нажми R или HELP — позови союзника',W/2,H*.27);ctx.restore();
+  } else if (gameState === 'gameover'){
     renderDungeon();
     renderGameOver();
   } else if (gameState === 'combos'){
